@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>轻量甘特 - 示例</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>甘特视图（示例）</h1>
+      <div class="controls">
+        <button id="refreshBtn">刷新</button>
+        <button id="downloadXlsx">下载 Excel</button>
+      </div>
+    </header>
+
+    <div class="main">
+      <aside class="left-panel">
+        <h3>任务列表</h3>
+        <div id="taskList"></div>
+      </aside>
+
+      <section class="gantt-panel">
+        <div id="ganttContainer">
+          <!-- SVG 甘特将插入到这里 -->
+          <svg id="ganttSvg"></svg>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Modal for note -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-content">
+      <button id="closeModal">×</button>
+      <h3 id="noteTitle">说明</h3>
+      <pre id="noteText"></pre>
+      <div id="attachments"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
