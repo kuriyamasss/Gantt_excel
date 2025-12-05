@@ -19,7 +19,6 @@ export default function useConnections() {
   }
 
   async function createConnection(conn) {
-    // conn: {FromID, ToID, Color, Style, Label, FromAnchor, ToAnchor}
     try {
       const res = await axios.post("/api/connections", conn);
       if (res.data && res.data.ConnID) {
@@ -44,11 +43,5 @@ export default function useConnections() {
     loadConnections();
   }, []);
 
-  return {
-    connections,
-    loading,
-    loadConnections,
-    createConnection,
-    deleteConnection,
-  };
+  return { connections, loading, loadConnections, createConnection, deleteConnection };
 }

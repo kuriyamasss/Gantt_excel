@@ -1,208 +1,265 @@
 // frontend/src/components/GanttView.jsx
-import React, { useRef, useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
+import Connector from "./Connector";
+import Annotation from "./Annotation";
+import TaskBar from "./TaskBar";
+import ConnectDragLine from "./ConnectDragLine";
+import useConnections from "../hooks/useConnections";
+import useZoom from "../hooks/useZoom";
+import useGanttCoords from "../hooks/useGanttCoords";
+import "../styles.css";
 
 /**
- * GanttView - 更健壮的甘特视图组件
+ * GanttView - 完整版
  * props:
- *  - tasks: array of task objects
- *  - minDate: ISO date string (yyyy-mm-dd) 或 null
- *  - maxDate: ISO date string 或 null
- *  - onTaskUpdate: function called after PATCH update
+ *  - tasks, minDate, maxDate
+ *  - onTaskUpdate() - reload
+ *  - criticalIds: []
  */
-export default function GanttView({ tasks, minDate, maxDate, onTaskUpdate }) {
+export default function GanttView({
+  tasks = [],
+  minDate,
+  maxDate,
+  onTaskUpdate,
+  criticalIds = [],
+}) {
   const svgRef = useRef(null);
+  const [selectedTask, setSelectedTask] = useState(null);
+  const [annotations, setAnnotations] = useState([]); // {id,text,x,y}
+  const [isCreatingConnection, setIsCreatingConnection] = useState(false);
+  const [dragLine, setDragLine] = useState(null); // {x1,y1,x2,y2,fromId}
+  const { connections, loadConnections, createConnection, deleteConnection } =
+    useConnections();
+  const { viewBox, zoomIn, zoomOut, resetZoom, screenToSvg, svgToScreen } =
+    useZoom(svgRef);
+  const { dateToX, daysBetween, xToDate } = useGanttCoords({ minDate, maxDate });
+
+  // refs for bars to compute anchors
+  const barsRef = useRef({});
 
   useEffect(() => {
-    renderGantt();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, minDate, maxDate]);
+    loadConnections();
+  }, []);
 
-  // 防护：确保 tasks 是数组
-  const safeTasks = Array.isArray(tasks) ? tasks : [];
-
-  // helper: days difference
-  const MS_PER_DAY = 24 * 3600 * 1000;
-  function dateToDays(d, base) {
-    return Math.round((new Date(d).getTime() - new Date(base).getTime()) / MS_PER_DAY);
+  // compute anchors from barsRef
+  function computeAnchor(taskID, side = "right") {
+    const el = barsRef.current[taskID];
+    if (!el) return null;
+    try {
+      const box = el.getBBox();
+      if (side === "right") return { x: box.x + box.width, y: box.y + box.height / 2 };
+      if (side === "left") return { x: box.x, y: box.y + box.height / 2 };
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    } catch (e) {
+      return null;
+    }
   }
 
-  // 渲染甘特（在 SVG 中）
-  function renderGantt() {
-    const svg = svgRef.current;
-    if (!svg) return;
+  // parse backend anchor "x,y"
+  function parseAnchor(s) {
+    if (!s) return null;
+    const [a, b] = s.split(",").map(Number);
+    if (isNaN(a) || isNaN(b)) return null;
+    return { x: a, y: b };
+  }
 
-    // 清空
-    svg.innerHTML = "";
+  // handle creating connection (mouse up on a target)
+  async function finishCreateConnection(toId, toAnchor) {
+    if (!dragLine || !dragLine.fromId) return cancelCreateConnection();
+    const fromId = dragLine.fromId;
+    const fromAnchorStr = `${dragLine.x1},${dragLine.y1}`;
+    const toAnchorStr = toAnchor ? `${toAnchor.x},${toAnchor.y}` : `${dragLine.x2},${dragLine.y2}`;
+    const payload = {
+      FromID: String(fromId),
+      ToID: String(toId),
+      FromAnchor: fromAnchorStr,
+      ToAnchor: toAnchorStr,
+      Color: "#2b7cff",
+      Style: "solid",
+      Label: ""
+    };
+    await createConnection(payload);
+    await loadConnections();
+    setDragLine(null);
+    setIsCreatingConnection(false);
+  }
 
-    // 基本布局参数（可调）
-    const left = 180;
-    const pxPerDay = 18;
-    const rowH = 34;
+  function cancelCreateConnection() {
+    setDragLine(null);
+    setIsCreatingConnection(false);
+  }
 
-    // 如果没有任务，显示空占位（不绘制 SVG 内容）
-    if (safeTasks.length === 0) {
-      // 设置一个最小画布，避免 SVG 尺寸为 0
-      svg.setAttribute("viewBox", `0 0 800 200`);
-      const ns = "http://www.w3.org/2000/svg";
-      const txt = document.createElementNS(ns, "text");
-      txt.setAttribute("x", 20);
-      txt.setAttribute("y", 40);
-      txt.setAttribute("fill", "#666");
-      txt.setAttribute("font-size", 14);
-      txt.textContent = "当前无任务或正在载入...";
-      svg.appendChild(txt);
-      return;
-    }
-
-    // 处理日期边界：若后端未提供min/max，则从任务中推断
-    let minD = null,
-      maxD = null;
-    if (minDate) minD = new Date(minDate);
-    if (maxDate) maxD = new Date(maxDate);
-
-    if (!minD || !maxD) {
-      const dates = [];
-      safeTasks.forEach((t) => {
-        if (t.Start) dates.push(new Date(t.Start));
-        if (t.End) dates.push(new Date(t.End));
-      });
-      if (dates.length === 0) {
-        // 无日期数据，使用今天为基准
-        minD = new Date();
-        maxD = new Date(minD.getTime() + 7 * MS_PER_DAY);
-      } else {
-        const minTime = Math.min(...dates.map((d) => d.getTime()));
-        const maxTime = Math.max(...dates.map((d) => d.getTime()));
-        minD = minD || new Date(minTime);
-        maxD = maxD || new Date(maxTime);
-      }
-    }
-
-    // 增加左右边距
-    const marginDays = 2;
-    const startD = new Date(minD.getTime() - marginDays * MS_PER_DAY);
-    const endD = new Date(maxD.getTime() + marginDays * MS_PER_DAY);
-    const totalDays = Math.ceil((endD - startD) / MS_PER_DAY) + 1;
-
-    const totalW = left + totalDays * pxPerDay + 80;
-    const totalH = Math.max(400, (safeTasks.length + 2) * rowH + 100);
-
-    svg.setAttribute("viewBox", `0 0 ${totalW} ${totalH}`);
-
-    const ns = "http://www.w3.org/2000/svg";
-
-    // grid layer
-    const grid = document.createElementNS(ns, "g");
-    svg.appendChild(grid);
-
-    // 日期竖线和标签（简化）
-    for (let d = 0; d < totalDays; d++) {
-      const x = left + d * pxPerDay;
-      const line = document.createElementNS(ns, "line");
-      line.setAttribute("x1", x);
-      line.setAttribute("y1", 0);
-      line.setAttribute("x2", x);
-      line.setAttribute("y2", totalH);
-      line.setAttribute("stroke", "#eee");
-      grid.appendChild(line);
-
-      if (d % 3 === 0) {
-        const date = new Date(startD.getTime() + d * MS_PER_DAY);
-        const txt = document.createElementNS(ns, "text");
-        txt.setAttribute("x", x + 2);
-        txt.setAttribute("y", 16);
-        txt.setAttribute("font-size", 10);
-        txt.setAttribute("fill", "#333");
-        txt.textContent = `${date.getMonth() + 1}/${date.getDate()}`;
-        grid.appendChild(txt);
-      }
-    }
-
-    // bars layer
-    const bars = document.createElementNS(ns, "g");
-    svg.appendChild(bars);
-
-    safeTasks.forEach((t, i) => {
-      // 检查 Start/End 是否存在
-      if (!t.Start || !t.End) return;
-
-      const sx = left + dateToDays(t.Start, startD) * pxPerDay;
-      const ex = left + dateToDays(t.End, startD) * pxPerDay + pxPerDay;
-      const w = Math.max(6, ex - sx);
-      const rect = document.createElementNS(ns, "rect");
-      rect.setAttribute("x", sx);
-      rect.setAttribute("y", 60 + i * rowH);
-      rect.setAttribute("width", w);
-      rect.setAttribute("height", rowH - 10);
-      rect.setAttribute("rx", 6);
-      rect.setAttribute("fill", "#7fb3ff");
-      rect.setAttribute("data-id", t.TaskID);
-
-      // attach drag handlers only if function provided
-      if (typeof attachDrag === "function") {
-        attachDrag(rect, t, startD, pxPerDay, left);
-      }
-
-      bars.appendChild(rect);
-
-      // left label
-      const txt = document.createElementNS(ns, "text");
-      txt.setAttribute("x", 8);
-      txt.setAttribute("y", 60 + i * rowH + 14);
-      txt.setAttribute("font-size", 12);
-      txt.setAttribute("fill", "#111");
-      txt.textContent = `${t.TaskID} ${t.TaskName}`;
-      svg.appendChild(txt);
+  // start create: get anchor and set dragLine
+  function startCreateConnection(fromId, fromAnchor) {
+    setIsCreatingConnection(true);
+    setDragLine({
+      fromId,
+      x1: fromAnchor.x,
+      y1: fromAnchor.y,
+      x2: fromAnchor.x,
+      y2: fromAnchor.y,
     });
   }
 
-  // 拖拽逻辑：更新位置后向后端 PATCH
-  function attachDrag(rect, task, minD, pxPerDay, left) {
-    let dragging = null;
-
-    rect.addEventListener("pointerdown", (e) => {
-      rect.setPointerCapture(e.pointerId);
-      const box = rect.getBBox();
-      dragging = { startX: e.clientX, origX: box.x, origW: box.width };
-    });
-
-    rect.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      const dx = e.clientX - dragging.startX;
-      rect.setAttribute("x", dragging.origX + dx);
-    });
-
-    rect.addEventListener("pointerup", async (e) => {
-      if (!dragging) return;
-      const newX = parseFloat(rect.getAttribute("x"));
-      const width = parseFloat(rect.getAttribute("width"));
-      const newStartDays = Math.round((newX - left) / pxPerDay);
-      const newEndDays = Math.round((newX + width - left - pxPerDay) / pxPerDay);
-      const newStart = new Date(minD.getTime() + newStartDays * MS_PER_DAY);
-      const newEnd = new Date(minD.getTime() + newEndDays * MS_PER_DAY);
-
-      try {
-        await axios.patch(`/api/tasks/${task.TaskID}`, {
-          Start: newStart.toISOString().slice(0, 10),
-          End: newEnd.toISOString().slice(0, 10),
-        });
-        if (typeof onTaskUpdate === "function") onTaskUpdate();
-      } catch (err) {
-        console.error("更新任务日期失败", err);
-      } finally {
-        dragging = null;
-      }
-    });
-
-    // allow pointercancel / leave to stop dragging
-    rect.addEventListener("pointercancel", () => (dragging = null));
-    rect.addEventListener("mouseleave", () => (dragging = null));
+  // mouse move while creating dragLine
+  function onMouseMoveCreate(e) {
+    if (!isCreatingConnection || !dragLine) return;
+    const p = screenToSvg(e.clientX, e.clientY);
+    setDragLine({ ...dragLine, x2: p.x, y2: p.y });
   }
 
+  // create annotation
+  function createAnnotationAt(x, y) {
+    const id = "A" + Date.now().toString(16);
+    const newNote = { id, text: "新注释", x, y };
+    setAnnotations((s) => [...s, newNote]);
+  }
+
+  // save annotation pos
+  function onAnnotationMove(id, pos) {
+    setAnnotations((s) => s.map((a) => (a.id === id ? { ...a, ...pos } : a)));
+  }
+
+  function onAnnotationDelete(id) {
+    setAnnotations((s) => s.filter((a) => a.id !== id));
+  }
+
+  // handle task drag updates from TaskBar (called with newStartDate/newEndDate)
+  async function onTaskDatesUpdated(taskID, newStartISO, newEndISO) {
+    try {
+      await axios.patch(`/api/tasks/${taskID}`, { Start: newStartISO, End: newEndISO });
+      if (typeof onTaskUpdate === "function") await onTaskUpdate();
+    } catch (err) {
+      console.error("update task error", err);
+    }
+  }
+
+  // helper to compute anchor for connection item (prefer stored anchors)
+  function anchorForConnectionSide(conn, side) {
+    if (side === "from") {
+      if (conn.FromAnchor) {
+        const p = parseAnchor(conn.FromAnchor);
+        if (p) return p;
+      }
+      return computeAnchor(conn.FromID, "right");
+    } else {
+      if (conn.ToAnchor) {
+        const p = parseAnchor(conn.ToAnchor);
+        if (p) return p;
+      }
+      return computeAnchor(conn.ToID, "left");
+    }
+  }
+
+  // zoom UI handlers will be rendered
   return (
-    <div className="gantt-view">
-      <svg ref={svgRef} style={{ width: "100%", height: 600 }} />
+    <div
+      className="gantt-container"
+      onPointerMove={onMouseMoveCreate}
+      style={{ position: "relative", flex: 1 }}
+    >
+      <div className="gantt-toolbar" style={{ padding: 8, display: "flex", gap: 8, alignItems: "center" }}>
+        <button onClick={() => zoomIn()}>放大</button>
+        <button onClick={() => zoomOut()}>缩小</button>
+        <button onClick={() => resetZoom()}>重置缩放</button>
+        <button onClick={() => {
+          // create annotation at center of svg view
+          const vb = viewBox();
+          createAnnotationAt(vb.x + vb.width/3, vb.y + 80);
+        }}>新增注释</button>
+        <div style={{ marginLeft: "auto", color: "#666" }}>
+          connections: {connections.length}
+        </div>
+      </div>
+
+      <svg ref={svgRef} className="gantt-svg" style={{ width: "100%", height: "calc(100vh - 140px)" }} viewBox={`${viewBox().x} ${viewBox().y} ${viewBox().width} ${viewBox().height}`}>
+        {/* background grid / header */}
+        <rect x={viewBox().x} y={viewBox().y} width={viewBox().width} height={viewBox().height} fill="#fff" />
+
+        {/* timeline labels - simple daily marks using dateToX */}
+        {minDate && maxDate && (() => {
+          const days = daysBetween(minDate, maxDate);
+          const marks = [];
+          for (let i = 0; i <= days; i++) {
+            const dateX = dateToX(minDate, i);
+            if (!isFinite(dateX)) continue;
+            marks.push(
+              <g key={"m"+i}>
+                <line x1={dateX} x2={dateX} y1={viewBox().y+40} y2={viewBox().y + viewBox().height - 20} stroke="#f0f0f0"/>
+                {i % Math.max(1, Math.ceil(days/20)) === 0 ? (
+                  <text x={dateX+2} y={viewBox().y+28} fontSize={12} fill="#333">{xToDate(dateX)}</text>
+                ) : null}
+              </g>
+            )
+          }
+          return marks;
+        })()}
+
+        {/* task bars */}
+        <g className="task-layer">
+          {tasks.map((t, i) => {
+            const y = 60 + i * 40;
+            const x1 = t.Start ? dateToX(t.Start) : dateToX(minDate);
+            const x2 = t.End ? dateToX(t.End) : (x1 + 24);
+            return (
+              <TaskBar
+                key={t.TaskID}
+                task={t}
+                x={x1}
+                y={y}
+                width={Math.max(20, x2 - x1)}
+                height={20}
+                ref={(el) => (barsRef.current[t.TaskID] = el)}
+                onStartCreateConnection={(anchor) => startCreateConnection(t.TaskID, anchor)}
+                onDatesChanged={(newStartISO, newEndISO) => onTaskDatesUpdated(t.TaskID, newStartISO, newEndISO)}
+                critical={criticalIds.includes(Number(t.TaskID))}
+                dateToX={dateToX}
+              />
+            );
+          })}
+        </g>
+
+        {/* connections from backend */}
+        <g className="connection-layer">
+          {connections.map((c) => {
+            const from = anchorForConnectionSide(c, "from");
+            const to = anchorForConnectionSide(c, "to");
+            if (!from || !to) return null;
+            return (
+              <Connector
+                key={c.ConnID}
+                from={from}
+                to={to}
+                style={c.Style}
+                color={c.Color}
+                label={c.Label}
+                onDelete={() => { deleteConnection(c.ConnID).then(loadConnections); }}
+              />
+            );
+          })}
+        </g>
+
+        {/* drag line while creating connection */}
+        {isCreatingConnection && dragLine ? (
+          <ConnectDragLine from={{x:dragLine.x1,y:dragLine.y1}} to={{x:dragLine.x2,y:dragLine.y2}} />
+        ) : null}
+
+        {/* annotations (rendered via foreignObject) */}
+        <g className="annotation-layer">
+          {annotations.map((a) => (
+            <Annotation
+              key={a.id}
+              id={a.id}
+              x={a.x}
+              y={a.y}
+              text={a.text}
+              onMove={(id,pos)=>onAnnotationMove(id,pos)}
+              onDelete={(id)=>onAnnotationDelete(id)}
+            />
+          ))}
+        </g>
+      </svg>
     </div>
   );
 }
