@@ -71,16 +71,17 @@ gantt_flask/
 ## 1. 克隆项目
 
 ```
-git clone <your-repo-url>
-cd gantt_flask
+git clone https://github.com/kuriyamasss/Gantt_excel.git
+cd Gantt_excel
 ```
 
-## 2. 可选：创建虚拟环境
+## 2. 可选：使用venv虚拟环境运行项目
 
 ```
 python -m venv venv
 # Windows:
 venv\Scripts\activate
+
 # macOS/Linux:
 source venv/bin/activate
 ```
@@ -100,7 +101,7 @@ python app.py
 访问：
 
 ```
-http://127.0.0.1:6868/
+http://127.0.0.1:6666/
 ```
 
 ---
