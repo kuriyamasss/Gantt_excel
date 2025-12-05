@@ -1,202 +1,336 @@
 # app.py
 import os
 import uuid
-import json
 from datetime import datetime, date
 from flask import Flask, jsonify, request, send_from_directory, abort, send_file
-import pandas as pd
-from filelock import FileLock
+from flask_cors import CORS
+from sqlalchemy import create_engine, Column, Integer, String, Date, Text, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.exc import NoResultFound
 
-DATA_XLSX = "data.xlsx"
+# Config
+DB_FILE = "data.db"
 UPLOAD_DIR = "uploads"
-LOCKFILE = DATA_XLSX + ".lock"
-
-# Ensure dirs
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+# Flask init
+app = Flask(__name__, static_folder="frontend/dist", static_url_path="/")
+CORS(app)
 
-# Utilities for Excel storage
-def ensure_workbook():
-    """
-    If data.xlsx doesn't exist, create with sample Tasks and Notes sheets.
-    """
-    if not os.path.exists(DATA_XLSX):
-        tasks = pd.DataFrame([
-            {"TaskID": 1, "ProjectID": "P1", "ParentTaskID": None, "TaskName": "项目启动", "Start": "2025-12-02", "End": "2025-12-05", "Assignee": "小王", "NoteID": "N1"},
-            {"TaskID": 2, "ProjectID": "P1", "ParentTaskID": 1, "TaskName": "需求确认", "Start": "2025-12-04", "End": "2025-12-10", "Assignee": "小李", "NoteID": "N2"},
-            {"TaskID": 3, "ProjectID": "P1", "ParentTaskID": None, "TaskName": "开发", "Start": "2025-12-07", "End": "2025-12-20", "Assignee": "小张", "NoteID": "N3"},
-        ])
-        notes = pd.DataFrame([
-            {"NoteID": "N1", "NoteText": "负责人：小王\n说明：负责需求收集\n附件:"},
-            {"NoteID": "N2", "NoteText": "负责人：小李\n说明：整理需求文档\n附件:"},
-            {"NoteID": "N3", "NoteText": "负责人：小张\n说明：开发主任务\n附件:"},
-        ])
-        with FileLock(LOCKFILE):
-            with pd.ExcelWriter(DATA_XLSX, engine="openpyxl") as writer:
-                tasks.to_excel(writer, sheet_name="Tasks", index=False)
-                notes.to_excel(writer, sheet_name="Notes", index=False)
+# SQLAlchemy init
+engine = create_engine(f"sqlite:///{DB_FILE}", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
-def read_dataframes():
-    ensure_workbook()
-    with FileLock(LOCKFILE):
-        df_tasks = pd.read_excel(DATA_XLSX, sheet_name="Tasks", engine="openpyxl")
-        df_notes = pd.read_excel(DATA_XLSX, sheet_name="Notes", engine="openpyxl")
-    # Normalize dates to ISO strings
-    df_tasks['Start'] = pd.to_datetime(df_tasks['Start']).dt.date
-    df_tasks['End'] = pd.to_datetime(df_tasks['End']).dt.date
-    return df_tasks, df_notes
+# Models
+class Task(Base):
+    __tablename__ = "tasks"
+    TaskID = Column(Integer, primary_key=True, autoincrement=True)
+    ProjectID = Column(String(64), nullable=True)
+    ParentTaskID = Column(Integer, nullable=True)
+    TaskName = Column(String(255), nullable=False)
+    Start = Column(Date, nullable=True)
+    End = Column(Date, nullable=True)
+    Assignee = Column(String(128), nullable=True)
+    NoteID = Column(String(64), nullable=True)
 
-def write_dataframes(df_tasks, df_notes):
-    with FileLock(LOCKFILE):
-        with pd.ExcelWriter(DATA_XLSX, engine="openpyxl", mode="w") as writer:
-            df_tasks.to_excel(writer, sheet_name="Tasks", index=False)
-            df_notes.to_excel(writer, sheet_name="Notes", index=False)
+class Note(Base):
+    __tablename__ = "notes"
+    NoteID = Column(String(32), primary_key=True)
+    NoteText = Column(Text, nullable=True)
+    # attachments are in Attachment table; keep a denormalized attachments_str for backward compatibility if needed
+    attachments_str = Column(Text, nullable=True)
 
-# APIs
+    attachments = relationship("Attachment", back_populates="note", cascade="all, delete-orphan")
 
-@app.route("/api/tasks", methods=["GET"])
+class Attachment(Base):
+    __tablename__ = "attachments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    note_id = Column(String(32), ForeignKey("notes.NoteID"))
+    filename = Column(String(255))
+    url = Column(String(1024))
+    note = relationship("Note", back_populates="attachments")
+
+class Connection(Base):
+    __tablename__ = "connections"
+    ConnID = Column(String(32), primary_key=True)
+    FromID = Column(String(64))
+    ToID = Column(String(64))
+    Color = Column(String(32), default="#2b7cff")
+    Style = Column(String(16), default="solid")
+    Label = Column(String(255), default="")
+
+# Create DB / tables
+def create_db():
+    Base.metadata.create_all(bind=engine)
+    # create example data if empty
+    db = SessionLocal()
+    try:
+        tcount = db.query(Task).count()
+        if tcount == 0:
+            # sample tasks
+            t1 = Task(ProjectID="P1", ParentTaskID=None, TaskName="项目启动", Start=date(2025,12,2), End=date(2025,12,5), Assignee="小王", NoteID="N1")
+            t2 = Task(ProjectID="P1", ParentTaskID=1, TaskName="需求确认", Start=date(2025,12,4), End=date(2025,12,10), Assignee="小李", NoteID="N2")
+            db.add_all([t1, t2])
+            # sample notes
+            n1 = Note(NoteID="N1", NoteText="负责人：小王\\n说明：负责需求收集", attachments_str="")
+            n2 = Note(NoteID="N2", NoteText="负责人：小李\\n说明：整理需求文档", attachments_str="")
+            db.add_all([n1, n2])
+            db.commit()
+    finally:
+        db.close()
+
+create_db()
+
+# Helpers
+def task_to_dict(t: Task):
+    return {
+        "TaskID": int(t.TaskID),
+        "ProjectID": t.ProjectID,
+        "ParentTaskID": int(t.ParentTaskID) if t.ParentTaskID is not None else None,
+        "TaskName": t.TaskName,
+        "Start": t.Start.isoformat() if t.Start else None,
+        "End": t.End.isoformat() if t.End else None,
+        "Assignee": t.Assignee,
+        "NoteID": t.NoteID
+    }
+
+def note_to_dict(n: Note):
+    attachments = [ {"filename": a.filename, "url": a.url} for a in n.attachments ] if n.attachments else []
+    # also parse attachments_str for backward compat (semicolon separated)
+    if n.attachments_str:
+        for s in str(n.attachments_str).split(";"):
+            if s:
+                # if not already present
+                if not any(a["url"].endswith(s) or a["filename"] == s for a in attachments):
+                    attachments.append({"filename": s, "url": f"/uploads/{s}"})
+    return {
+        "NoteID": n.NoteID,
+        "NoteText": n.NoteText or "",
+        "Attachments": attachments
+    }
+
+# Routes
+
+@app.route('/api/tasks', methods=['GET'])
 def api_get_tasks():
-    df_tasks, df_notes = read_dataframes()
-    tasks = []
-    for _, r in df_tasks.iterrows():
-        tasks.append({
-            "TaskID": int(r["TaskID"]),
-            "ProjectID": r.get("ProjectID", None),
-            "ParentTaskID": int(r["ParentTaskID"]) if pd.notna(r.get("ParentTaskID", None)) else None,
-            "TaskName": r.get("TaskName", ""),
-            "Start": r["Start"].isoformat() if not pd.isna(r["Start"]) else None,
-            "End": r["End"].isoformat() if not pd.isna(r["End"]) else None,
-            "Assignee": r.get("Assignee", ""),
-            "NoteID": r.get("NoteID", "")
-        })
-    # also return min/max dates for rendering range
-    dates = []
-    for t in tasks:
-        if t["Start"]: dates.append(date.fromisoformat(t["Start"]))
-        if t["End"]: dates.append(date.fromisoformat(t["End"]))
-    min_date = min(dates).isoformat() if dates else None
-    max_date = max(dates).isoformat() if dates else None
-    return jsonify({"tasks": tasks, "min_date": min_date, "max_date": max_date})
+    db = SessionLocal()
+    try:
+        rows = db.query(Task).order_by(Task.TaskID).all()
+        tasks = [task_to_dict(r) for r in rows]
+        dates = []
+        for t in tasks:
+            if t["Start"]: dates.append(date.fromisoformat(t["Start"]))
+            if t["End"]: dates.append(date.fromisoformat(t["End"]))
+        min_date = min(dates).isoformat() if dates else None
+        max_date = max(dates).isoformat() if dates else None
+        return jsonify({"tasks": tasks, "min_date": min_date, "max_date": max_date})
+    finally:
+        db.close()
 
-@app.route("/api/tasks", methods=["POST"])
+@app.route('/api/tasks', methods=['POST'])
 def api_create_or_update_task():
     data = request.get_json()
     if not data:
         return jsonify({"error":"no json"}), 400
-    df_tasks, df_notes = read_dataframes()
-    # Expect TaskID for update; if not present -> create new ID
-    if "TaskID" in data and data["TaskID"] is not None:
-        # update existing
-        tid = int(data["TaskID"])
-        if tid in df_tasks['TaskID'].values:
-            idx = df_tasks.index[df_tasks['TaskID'] == tid][0]
-            # update fields
+    db = SessionLocal()
+    try:
+        if "TaskID" in data and data.get("TaskID"):
+            # update existing
+            tid = int(data["TaskID"])
+            try:
+                t = db.query(Task).filter(Task.TaskID==tid).one()
+            except NoResultFound:
+                return jsonify({"error":"TaskID not found"}), 404
             for col in ["ProjectID","ParentTaskID","TaskName","Start","End","Assignee","NoteID"]:
                 if col in data:
-                    df_tasks.at[idx, col] = data[col]
+                    val = data[col]
+                    if col in ["Start","End"] and val:
+                        val = date.fromisoformat(val)
+                    setattr(t, col, val)
+            db.commit()
+            return jsonify({"ok":True}), 200
         else:
-            return jsonify({"error":"TaskID not found"}), 404
-    else:
-        # create new ID
-        new_id = int(df_tasks['TaskID'].max()) + 1 if not df_tasks.empty else 1
-        entry = {
-            "TaskID": new_id,
-            "ProjectID": data.get("ProjectID"),
-            "ParentTaskID": data.get("ParentTaskID"),
-            "TaskName": data.get("TaskName"),
-            "Start": data.get("Start"),
-            "End": data.get("End"),
-            "Assignee": data.get("Assignee"),
-            "NoteID": data.get("NoteID"),
-        }
-        df_tasks = pd.concat([df_tasks, pd.DataFrame([entry])], ignore_index=True)
-    write_dataframes(df_tasks, df_notes)
-    return jsonify({"ok": True}), 200
+            # create
+            new_task = Task(
+                ProjectID = data.get("ProjectID"),
+                ParentTaskID = data.get("ParentTaskID"),
+                TaskName = data.get("TaskName") or "新任务",
+                Start = date.fromisoformat(data["Start"]) if data.get("Start") else None,
+                End = date.fromisoformat(data["End"]) if data.get("End") else None,
+                Assignee = data.get("Assignee"),
+                NoteID = data.get("NoteID"),
+            )
+            db.add(new_task)
+            db.commit()
+            return jsonify({"ok":True, "TaskID": new_task.TaskID}), 200
+    finally:
+        db.close()
 
-@app.route("/api/tasks/<int:taskid>", methods=["DELETE"])
-def api_delete_task(taskid):
-    df_tasks, df_notes = read_dataframes()
-    if taskid not in df_tasks['TaskID'].values:
-        return jsonify({"error":"not found"}), 404
-    df_tasks = df_tasks[df_tasks['TaskID'] != taskid]
-    write_dataframes(df_tasks, df_notes)
-    return jsonify({"ok": True})
+@app.route('/api/tasks/<int:taskid>', methods=['PATCH'])
+def api_patch_task(taskid):
+    payload = request.get_json()
+    if not payload:
+        return jsonify({"error":"no json"}), 400
+    db = SessionLocal()
+    try:
+        try:
+            t = db.query(Task).filter(Task.TaskID==taskid).one()
+        except NoResultFound:
+            return jsonify({"error":"not found"}), 404
+        if "Start" in payload:
+            t.Start = date.fromisoformat(payload["Start"]) if payload["Start"] else None
+        if "End" in payload:
+            t.End = date.fromisoformat(payload["End"]) if payload["End"] else None
+        db.commit()
+        return jsonify({"ok": True}), 200
+    finally:
+        db.close()
 
-@app.route("/api/notes/<noteid>", methods=["GET"])
+@app.route('/api/notes/<noteid>', methods=['GET'])
 def api_get_note(noteid):
-    _, df_notes = read_dataframes()
-    sel = df_notes[df_notes['NoteID'] == noteid]
-    if sel.empty:
-        return jsonify({"error":"not found"}), 404
-    row = sel.iloc[0]
-    attachments = []
-    att_field = row.get("Attachments", "")
-    if isinstance(att_field, str) and att_field.strip():
-        attachments = [a for a in att_field.split(";") if a]
-    return jsonify({"NoteID": row["NoteID"], "NoteText": row.get("NoteText", ""), "Attachments": attachments})
+    db = SessionLocal()
+    try:
+        n = db.query(Note).filter(Note.NoteID==noteid).first()
+        if not n:
+            return jsonify({"error":"not found"}), 404
+        return jsonify(note_to_dict(n))
+    finally:
+        db.close()
 
-@app.route("/api/notes", methods=["POST"])
+@app.route('/api/notes', methods=['POST'])
 def api_create_or_update_note():
     data = request.get_json()
     if not data:
         return jsonify({"error":"no json"}), 400
-    df_tasks, df_notes = read_dataframes()
-    if "NoteID" in data and data["NoteID"]:
-        nid = data["NoteID"]
-        if nid in df_notes['NoteID'].values:
-            idx = df_notes.index[df_notes['NoteID'] == nid][0]
-            df_notes.at[idx, 'NoteText'] = data.get("NoteText", df_notes.at[idx,'NoteText'])
-            df_notes.at[idx, 'Attachments'] = data.get("Attachments", df_notes.at[idx,'Attachments'])
+    db = SessionLocal()
+    try:
+        attachments = data.get("Attachments", [])
+        if isinstance(attachments, list):
+            # attachments expected as list of urls or {"url", "filename"}
+            pass
+        if "NoteID" in data and data.get("NoteID"):
+            # update
+            nid = data["NoteID"]
+            n = db.query(Note).filter(Note.NoteID==nid).first()
+            if n:
+                n.NoteText = data.get("NoteText", n.NoteText)
+                # handle attachments: replace attachments table entries
+                if attachments is not None:
+                    # clear existing
+                    n.attachments = []
+                    for a in attachments:
+                        if isinstance(a, dict):
+                            url = a.get("url")
+                            filename = a.get("filename") or (url.split("/")[-1] if url else "")
+                        else:
+                            url = str(a)
+                            filename = url.split("/")[-1]
+                        n.attachments.append(Attachment(filename=filename, url=url))
+                db.commit()
+                return jsonify({"ok":True}), 200
+            else:
+                # create with specified NoteID
+                new = Note(NoteID=nid, NoteText=data.get("NoteText",""))
+                for a in attachments or []:
+                    if isinstance(a, dict):
+                        url = a.get("url"); filename = a.get("filename") or (url.split("/")[-1] if url else "")
+                    else:
+                        url = str(a); filename = url.split("/")[-1]
+                    new.attachments.append(Attachment(filename=filename, url=url))
+                db.add(new); db.commit()
+                return jsonify({"ok":True, "NoteID": nid}), 200
         else:
-            # create with provided NoteID
-            entry = {"NoteID": nid, "NoteText": data.get("NoteText", ""), "Attachments": data.get("Attachments","")}
-            df_notes = pd.concat([df_notes, pd.DataFrame([entry])], ignore_index=True)
-    else:
-        # create new NoteID
-        new_nid = "N" + str(uuid.uuid4())[:8]
-        entry = {"NoteID": new_nid, "NoteText": data.get("NoteText", ""), "Attachments": data.get("Attachments","")}
-        df_notes = pd.concat([df_notes, pd.DataFrame([entry])], ignore_index=True)
-    write_dataframes(df_tasks, df_notes)
-    return jsonify({"ok": True}), 200
+            # create new Note with generated ID
+            new_nid = "N" + uuid.uuid4().hex[:8]
+            new = Note(NoteID=new_nid, NoteText=data.get("NoteText",""))
+            for a in attachments or []:
+                if isinstance(a, dict):
+                    url = a.get("url"); filename = a.get("filename") or (url.split("/")[-1] if url else "")
+                else:
+                    url = str(a); filename = url.split("/")[-1]
+                new.attachments.append(Attachment(filename=filename, url=url))
+            db.add(new); db.commit()
+            return jsonify({"ok":True, "NoteID": new_nid}), 200
+    finally:
+        db.close()
 
-@app.route("/api/upload", methods=["POST"])
+@app.route('/api/connections', methods=['GET'])
+def api_get_connections():
+    db = SessionLocal()
+    try:
+        rows = db.query(Connection).all()
+        conns = []
+        for r in rows:
+            conns.append({
+                "ConnID": r.ConnID,
+                "FromID": r.FromID,
+                "ToID": r.ToID,
+                "Color": r.Color,
+                "Style": r.Style,
+                "Label": r.Label
+            })
+        return jsonify({"connections": conns})
+    finally:
+        db.close()
+
+@app.route('/api/connections', methods=['POST'])
+def api_create_connection():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error":"no json"}), 400
+    db = SessionLocal()
+    try:
+        new_id = "C" + uuid.uuid4().hex[:8]
+        entry = Connection(
+            ConnID=new_id,
+            FromID = data.get("FromID"),
+            ToID = data.get("ToID"),
+            Color = data.get("Color", "#2b7cff"),
+            Style = data.get("Style", "solid"),
+            Label = data.get("Label", "")
+        )
+        db.add(entry)
+        db.commit()
+        return jsonify({"ok": True, "ConnID": new_id}), 200
+    finally:
+        db.close()
+
+@app.route('/api/upload', methods=['POST'])
 def api_upload():
-    """
-    Accept file upload in form-data under 'file'; save to uploads/ and return file URL.
-    """
     if 'file' not in request.files:
-        return jsonify({"error":"no file part"}), 400
+        return jsonify({'error':'no file part'}), 400
     f = request.files['file']
     if f.filename == '':
-        return jsonify({"error":"empty filename"}), 400
-    # sanitize filename by prefixing uuid
+        return jsonify({'error':'empty filename'}), 400
     fn = f"{uuid.uuid4().hex[:8]}_{f.filename}"
     dest = os.path.join(UPLOAD_DIR, fn)
     f.save(dest)
-    # Return URL to fetch file
     url = f"/uploads/{fn}"
-    return jsonify({"url": url, "filename": fn})
+    return jsonify({'url': url, 'filename': fn})
 
-@app.route("/uploads/<path:fname>")
+@app.route('/uploads/<path:fname>')
 def uploaded_file(fname):
     path = os.path.join(UPLOAD_DIR, fname)
     if os.path.exists(path):
-        # send as attachment or inline depending on type
         return send_from_directory(UPLOAD_DIR, fname)
     else:
         abort(404)
 
-@app.route("/download_excel")
+@app.route('/download_excel')
 def download_excel():
-    ensure_workbook()
-    return send_file(DATA_XLSX, as_attachment=True)
+    # For backward compatibility keep endpoint, but we now use SQLite.
+    # Offer to download the SQLite DB file (or CSV export). We'll return the SQLite DB.
+    if os.path.exists(DB_FILE):
+        return send_file(DB_FILE, as_attachment=True)
+    else:
+        abort(404)
 
-# Serve frontend entry
-@app.route("/")
+# Serve frontend (if built)
+@app.route('/')
 def index():
-    return app.send_static_file("index.html")
+    return app.send_static_file('index.html')
 
-if __name__ == "__main__":
-    ensure_workbook()
-    app.run(debug=True, port=8964)
+if __name__ == '__main__':
+    create_db()
+    app.run(debug=True, port=6868)

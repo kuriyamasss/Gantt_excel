@@ -1,5 +1,8 @@
 Flask==2.3.3
+Flask-Cors==4.0.0
+SQLAlchemy==2.0.25
 pandas==2.2.3
 openpyxl==3.1.2
 filelock==3.12.2
 python-dateutil==2.8.2
+werkzeug==2.3.7
