@@ -7,6 +7,8 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, Column, Integer, String, Date, Text, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.exc import NoResultFound
+from sqlalchemy import and_
+from collections import defaultdict, deque
 
 # Config
 DB_FILE = "data.db"
@@ -50,6 +52,35 @@ class Attachment(Base):
     filename = Column(String(255))
     url = Column(String(1024))
     note = relationship("Note", back_populates="attachments")
+
+    # 新增/替换的模型定义片段（放在 Note/Attachment 之后）
+class Dependency(Base):
+    """
+    任务依赖表：
+      - DepID: 主键
+      - TaskID: 被依赖的任务（后继）
+      - PreTaskID: 前置任务（前置）
+      - Type: 依赖类型: 'FS' (finish->start), 'SS', 'FF', 'SF'
+      - Lag: 整数天（正为延迟，负为提前）
+    """
+    __tablename__ = "dependencies"
+    DepID = Column(Integer, primary_key=True, autoincrement=True)
+    TaskID = Column(Integer, nullable=False)       # 后继任务
+    PreTaskID = Column(Integer, nullable=False)    # 前置任务
+    Type = Column(String(8), default="FS")         # default Finish->Start
+    Lag = Column(Integer, default=0)
+
+class Connection(Base):
+    __tablename__ = "connections"
+    ConnID = Column(String(32), primary_key=True)
+    FromID = Column(String(64))
+    ToID = Column(String(64))
+    Color = Column(String(32), default="#2b7cff")
+    Style = Column(String(16), default="solid")
+    Label = Column(String(255), default="")
+    # 锚点坐标（在 SVG 坐标系下保存 float）
+    FromAnchorX = Column(String(64), nullable=True)   # 保存为 "x,y" 字符串，或 JSON
+    ToAnchorX = Column(String(64), nullable=True)
 
 class Connection(Base):
     __tablename__ = "connections"
@@ -109,7 +140,134 @@ def note_to_dict(n: Note):
         "NoteText": n.NoteText or "",
         "Attachments": attachments
     }
+def compute_schedule_and_update(db_session):
+    """
+    读取 tasks 和 dependencies（FS,SS,FF,SF, Lag），
+    计算每个任务的 duration (days) = (End-Start)+1 (若 Start/End 存在)
+    或若无 End/Start 则使用 duration=1（保守值）。
+    使用拓扑排序做前向/后向遍历，计算 ES/EF/LS/LF 和 Slack。
+    最终把新的 Start/End 写回 DB（以 earliest schedule 为准）。
+    返回任务调度结果字典。
+    """
 
+    # 1. 读取任务
+    tasks = {t.TaskID: t for t in db_session.query(Task).all()}
+    # durations in days
+    dur = {}
+    for tid, t in tasks.items():
+        if t.Start and t.End:
+            dur[tid] = (t.End - t.Start).days + 1
+            if dur[tid] <= 0:
+                dur[tid] = 1
+        else:
+            dur[tid] = 1
+
+    # 2. 构建图（以后继为 key，记录前置）
+    preds = defaultdict(list)
+    succs = defaultdict(list)
+    for d in db_session.query(Dependency).all():
+        preds[d.TaskID].append((d.PreTaskID, d.Type or "FS", d.Lag or 0))
+        succs[d.PreTaskID].append((d.TaskID, d.Type or "FS", d.Lag or 0))
+
+    # 3. 拓扑排序（检测环）
+    indeg = {tid:0 for tid in tasks}
+    for tid in tasks:
+        for (suc,typ,lag) in succs.get(tid,[]):
+            indeg[suc] = indeg.get(suc,0) + 1
+    q = deque([tid for tid,v in indeg.items() if v==0])
+    topo = []
+    while q:
+        n = q.popleft(); topo.append(n)
+        for (suc,typ,lag) in succs.get(n,[]):
+            indeg[suc] -= 1
+            if indeg[suc]==0: q.append(suc)
+    if len(topo) != len(tasks):
+        # 有环，返回错误信息
+        return {"error":"dependency cycle detected"}
+
+    # 4. 前向遍历计算 ES/EF（使用天数，从 0 基准）
+    ES = {tid:0 for tid in tasks}
+    EF = {tid:dur[tid] for tid in tasks}
+    for n in topo:
+        # consider all predecessors constraints
+        best_es = ES.get(n,0)
+        for (p,typ,lag) in preds.get(n,[]):
+            if typ == "FS":
+                # successor ES >= pred.EF + lag
+                cand = EF[p] + lag
+            elif typ == "SS":
+                cand = ES[p] + lag
+            elif typ == "FF":
+                # successor EF >= pred.EF + lag  => successor ES >= pred.EF + lag - dur[n]
+                cand = EF[p] + lag - dur[n]
+            elif typ == "SF":
+                # successor ES >= ES[p] + lag - dur[n]
+                cand = ES[p] + lag - dur[n]
+            else:
+                cand = EF[p] + lag
+            if cand > best_es: best_es = cand
+        ES[n] = best_es
+        EF[n] = ES[n] + dur[n]
+
+    # 5. 后向遍历计算 LS/LF
+    LS = {tid:0 for tid in tasks}
+    LF = {tid:0 for tid in tasks}
+    # project finish = max EF
+    project_finish = max(EF.values()) if EF else 0
+    for tid in tasks:
+        LF[tid] = project_finish
+        LS[tid] = LF[tid] - dur[tid]
+    for n in reversed(topo):
+        # successors constraints
+        best_lf = LF.get(n, project_finish)
+        for (suc,typ,lag) in succs.get(n,[]):
+            if typ == "FS":
+                cand = LS[suc] - lag
+            elif typ == "SS":
+                cand = ES[suc] - lag
+            elif typ == "FF":
+                cand = LF[suc] - lag
+            elif typ == "SF":
+                cand = ES[suc] - lag + dur[n]
+            else:
+                cand = LS[suc] - lag
+            if cand < best_lf: best_lf = cand
+        LF[n] = best_lf
+        LS[n] = LF[n] - dur[n]
+
+    # 6. 计算 slack & identify critical tasks (slack == 0)
+    slack = {tid: LS[tid] - ES[tid] for tid in tasks}
+    critical = [tid for tid, s in slack.items() if s == 0]
+
+    # 7. 将 ES 转换为 dates: choose project start baseline
+    # choose baseline = min existing Start if any, else today
+    existing_dates = [t.Start for t in tasks.values() if t.Start]
+    baseline = min(existing_dates) if existing_dates else date.today()
+    # write back new Start/End (as baseline + ES days)
+    for tid, t in tasks.items():
+        new_start = baseline + timedelta(days=ES[tid])
+        new_end = baseline + timedelta(days=EF[tid]-1)
+        # update DB record
+        t.Start = new_start
+        t.End = new_end
+    db_session.commit()
+
+    # prepare result mapping
+    result = {}
+    for tid in tasks:
+        result[tid] = {
+            "TaskID": tid,
+            "Duration": dur[tid],
+            "ES": ES[tid],
+            "EF": EF[tid],
+            "LS": LS[tid],
+            "LF": LF[tid],
+            "Slack": slack[tid],
+            "Critical": tid in critical,
+            "Start": str((baseline + timedelta(days=ES[tid])).isoformat()),
+            "End": str((baseline + timedelta(days=EF[tid]-1)).isoformat())
+        }
+    return {"result": result, "project_finish": project_finish, "critical": critical}
 # Routes
 
 @app.route('/api/tasks', methods=['GET'])
@@ -325,11 +483,71 @@ def download_excel():
         return send_file(DB_FILE, as_attachment=True)
     else:
         abort(404)
+        
+# 获取所有依赖（或某个任务的依赖）
+@app.route('/api/dependencies', methods=['GET'])
+def api_get_dependencies():
+    task = request.args.get('task')  # optional: ?task=123
+    db = SessionLocal()
+    try:
+        q = db.query(Dependency)
+        if task:
+            q = q.filter(or_(Dependency.TaskID==int(task), Dependency.PreTaskID==int(task)))
+        rows = q.all()
+        out = []
+        for r in rows:
+            out.append({
+                "DepID": r.DepID,
+                "TaskID": r.TaskID,
+                "PreTaskID": r.PreTaskID,
+                "Type": r.Type,
+                "Lag": r.Lag
+            })
+        return jsonify({"dependencies": out})
+    finally:
+        db.close()
+
+# 创建依赖
+@app.route('/api/dependencies', methods=['POST'])
+def api_create_dependency():
+    data = request.get_json()
+    if not data: return jsonify({"error":"no json"}), 400
+    db = SessionLocal()
+    try:
+        dep = Dependency(TaskID=int(data["TaskID"]), PreTaskID=int(data["PreTaskID"]),
+                         Type=data.get("Type","FS"), Lag=int(data.get("Lag",0)))
+        db.add(dep); db.commit()
+        return jsonify({"ok":True, "DepID": dep.DepID})
+    finally:
+        db.close()
+
+# 删除依赖
+@app.route('/api/dependencies/<int:depid>', methods=['DELETE'])
+def api_delete_dependency(depid):
+    db = SessionLocal()
+    try:
+        r = db.query(Dependency).filter(Dependency.DepID==depid).first()
+        if not r: return jsonify({"error":"not found"}), 404
+        db.delete(r); db.commit()
+        return jsonify({"ok":True})
+    finally:
+        db.close()
 
 # Serve frontend (if built)
 @app.route('/')
 def index():
     return app.send_static_file('index.html')
+
+@app.route('/api/schedule/run', methods=['POST'])
+def api_run_schedule():
+    db = SessionLocal()
+    try:
+        res = compute_schedule_and_update(db)
+        if "error" in res:
+            return jsonify(res), 400
+        return jsonify(res)
+    finally:
+        db.close()
 
 if __name__ == '__main__':
     create_db()
